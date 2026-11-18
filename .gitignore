@@ -1,0 +1,7 @@
+/target/
+/dist/
+/shots/
+*.bak-*
+.DS_Store
+# Machine-local cargo config (e.g. absolute tool paths); see README for the cross-build setup.
+/.cargo/
