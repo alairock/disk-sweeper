@@ -18,8 +18,10 @@ The screenshots use made-up demo data (see [Screenshots](#screenshots)).
   single folder without rescanning the whole disk.
 - **Biggest files**: the 200 largest files found by the scan.
 - **Cleanup**: measures and clears app caches, logs, Xcode build data (macOS), temp folders,
-  crash dumps and the thumbnail cache (Windows), old downloads, and the Trash. Old downloads go to
-  the Trash rather than being deleted.
+  crash dumps and Explorer's thumbnail cache files (`thumbcache_*.db`, Windows), old downloads, and
+  the Trash. Old downloads go to the Trash rather than being deleted. If you also pick the Trash,
+  it is emptied first, so the downloads moved in that run can still be restored. Items moved to
+  the Trash are reported separately from space actually freed.
 - **"Not scanned" reconciliation**: after a whole-disk scan, Disk Sweeper compares what it found
   with the space the disk reports as used and explains the difference. Usually that is separate
   volumes the scan can't enter (on macOS: VM, Preboot, System, Recovery), folders it wasn't allowed
@@ -49,6 +51,10 @@ Limitations:
 
 - Without Full Disk Access on macOS (or administrator rights on Windows), protected folders count
   as zero, so totals come up short. The app lists the folders it couldn't read.
+- On Windows, "Move to Recycle Bin" never falls back to deleting for good: if a drive has no
+  Recycle Bin, the item is too large for it, or the bin is turned off, the item stays in place and
+  the app shows an error. (Implemented with IFileOperation; not yet tested on a real Windows
+  machine.)
 - macOS protects some files (such as parts of Xcode simulators) so that they can't be moved to the
   Trash. For simulator runtimes the app offers to remove them through Xcode's own tool instead.
 - Sizes are estimates when files share space on disk (APFS clones; on Windows, hard links among
@@ -76,9 +82,13 @@ The Windows cross-build uses [zig](https://ziglang.org/) as the linker and dllto
 MinGW nor Visual Studio is needed:
 
 ```sh
-brew install zig        # tested with zig 0.11
 tools/package.sh
 ```
+
+The cross-build was tested with zig `0.11.0-dev.3382+c16d4ab9e`. Newer releases, including the
+current Homebrew formula (`brew install zig`), haven't been verified; the shims may need changes
+if zig's linker or dlltool flags have changed. Older and pinned releases are available from
+[ziglang.org/download](https://ziglang.org/download/).
 
 `tools/zig-win-cc.sh` and `tools/zig-dlltool.sh` adapt rustc's GNU-style linker and dlltool
 arguments for zig. A plain `cargo build --target x86_64-pc-windows-gnu` needs the same two settings

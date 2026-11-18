@@ -133,7 +133,8 @@ pub struct App {
     cats: Vec<Category>,
     old_days: u32,
     measuring: Option<Receiver<Vec<Option<(u64, u64)>>>>,
-    cleaning: Option<Receiver<(u64, u64)>>,
+    /// (freed, moved to the Trash, skipped).
+    cleaning: Option<Receiver<(u64, u64, u64)>>,
     last_clean: Option<String>,
     cleaned_paths: Vec<PathBuf>,
     shot: Option<Shot>,
@@ -388,7 +389,7 @@ impl App {
         let (tx, rx) = channel();
         std::thread::spawn(move || {
             let o = cleanup::clean(cleanup::Kind::Trash, &[], 0);
-            let _ = tx.send((o.freed, o.skipped));
+            let _ = tx.send((o.freed, o.trashed, o.skipped));
         });
         self.cleaning = Some(rx);
     }
@@ -417,11 +418,13 @@ impl App {
     }
 
     fn start_clean(&mut self) {
-        let jobs: Vec<_> = self.cats.iter().filter(|c| c.selected).map(|c| (c.kind, c.paths.clone())).collect();
+        let picked: Vec<_> = self.cats.iter().filter(|c| c.selected).map(|c| (c.kind, c.paths.clone())).collect();
+        let kinds: Vec<_> = picked.iter().map(|j| j.0).collect();
+        let jobs: Vec<_> = cleanup::run_order(&kinds).into_iter().map(|i| picked[i].clone()).collect();
         // Folders to re-read in the open scan once cleaning is done.
         self.cleaned_paths = jobs.iter().flat_map(|(k, p)| {
             let mut v = p.clone();
-            if *k != cleanup::Kind::Contents {
+            if !matches!(k, cleanup::Kind::Contents | cleanup::Kind::ThumbCache) {
                 v.extend(platform::trash_folder());
             }
             v
@@ -429,13 +432,14 @@ impl App {
         let days = self.old_days;
         let (tx, rx) = channel();
         std::thread::spawn(move || {
-            let (mut freed, mut skipped) = (0, 0);
+            let (mut freed, mut trashed, mut skipped) = (0, 0, 0);
             for (k, p) in &jobs {
                 let o = cleanup::clean(*k, p, days);
                 freed += o.freed;
+                trashed += o.trashed;
                 skipped += o.skipped;
             }
-            let _ = tx.send((freed, skipped));
+            let _ = tx.send((freed, trashed, skipped));
         });
         self.cleaning = Some(rx);
     }
@@ -518,12 +522,19 @@ impl App {
             }
         }
         if let Some(rx) = &self.cleaning {
-            if let Ok((freed, skipped)) = rx.try_recv() {
+            if let Ok((freed, trashed, skipped)) = rx.try_recv() {
                 let mut text = format!("Done — freed {}.", human(freed));
+                if trashed > 0 {
+                    text += &format!(
+                        " Moved {} to the {} (not freed until you empty it).",
+                        human(trashed),
+                        platform::TRASH_NAME
+                    );
+                }
                 if skipped > 0 {
                     text += &format!(" {skipped} item(s) were in use or protected and were left alone.");
                 }
-                if skipped > 0 && freed == 0 {
+                if skipped > 0 && freed == 0 && trashed == 0 {
                     self.message = Some(("Nothing could be removed — the system blocked it.".into(), false));
                 } else {
                     self.message = Some((text.clone(), true));
@@ -1463,9 +1474,17 @@ impl App {
                 (
                     "Clean now?".to_string(),
                     format!(
-                        "This clears: {}.\nCaches, logs and temp files are deleted for good; old downloads go to the {}.",
+                        "This clears: {}.\nCaches, logs and temp files are deleted for good; old downloads go to the {}.{}",
                         names.join(", "),
-                        platform::TRASH_NAME
+                        platform::TRASH_NAME,
+                        if self.cats.iter().any(|c| c.selected && c.kind == cleanup::Kind::Trash) {
+                            format!(
+                                " The {} is emptied first, so downloads moved now can still be restored.",
+                                platform::TRASH_NAME
+                            )
+                        } else {
+                            String::new()
+                        }
                     ),
                     "Clean now".to_string(),
                 )

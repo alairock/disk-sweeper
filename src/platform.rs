@@ -287,23 +287,100 @@ fn wide(s: &std::ffi::OsStr) -> Vec<u16> {
 }
 
 /// Move a file or folder to the Trash / Recycle Bin so it can be restored.
+///
+/// Windows: uses IFileOperation with "recycle on delete" and a progress sink that vetoes any
+/// delete Windows says it can't recycle (drive without a Recycle Bin, item too big, bin turned
+/// off). Then the item stays where it is and an error comes back; it is never deleted for good.
 #[cfg(windows)]
 pub fn move_to_trash(path: &Path) -> Result<(), String> {
-    use windows_sys::Win32::UI::Shell::{
-        SHFileOperationW, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT, FO_DELETE,
-        SHFILEOPSTRUCTW,
+    use std::cell::Cell;
+    use std::rc::Rc;
+    use windows::core::{implement, Result as WinResult, HRESULT, PCWSTR};
+    use windows::Win32::Foundation::E_ABORT;
+    use windows::Win32::System::Com::{
+        CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE,
     };
-    let mut from = wide(path.as_os_str());
-    from.push(0); // list must end with two NULs
-    let mut op: SHFILEOPSTRUCTW = unsafe { std::mem::zeroed() };
-    op.wFunc = FO_DELETE;
-    op.pFrom = from.as_ptr();
-    op.fFlags = (FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI) as u16;
-    let r = unsafe { SHFileOperationW(&mut op) };
-    if r == 0 && op.fAnyOperationsAborted == 0 {
-        Ok(())
-    } else {
-        Err(format!("Windows couldn't move it to the Recycle Bin (code {r})"))
+    use windows::Win32::UI::Shell::{
+        FileOperation, IFileOperation, IFileOperationProgressSink, IFileOperationProgressSink_Impl, IShellItem,
+        SHCreateItemFromParsingName, FOFX_EARLYFAILURE, FOFX_RECYCLEONDELETE, FOF_ALLOWUNDO, FOF_NO_CONNECTED_ELEMENTS,
+        FOF_NO_UI, TSF_DELETE_RECYCLE_IF_POSSIBLE,
+    };
+
+    #[implement(IFileOperationProgressSink)]
+    struct Sink {
+        /// Windows was about to delete without recycling, and the sink said no.
+        refused: Rc<Cell<bool>>,
+        /// A delete went through but nothing landed in the Recycle Bin.
+        permanent: Rc<Cell<bool>>,
+    }
+
+    #[allow(non_snake_case)]
+    impl IFileOperationProgressSink_Impl for Sink_Impl {
+        fn PreDeleteItem(&self, dwflags: u32, _item: Option<&IShellItem>) -> WinResult<()> {
+            if dwflags & TSF_DELETE_RECYCLE_IF_POSSIBLE.0 as u32 == 0 {
+                self.refused.set(true);
+                return Err(E_ABORT.into());
+            }
+            Ok(())
+        }
+        fn PostDeleteItem(&self, _f: u32, _item: Option<&IShellItem>, hr: HRESULT, recycled: Option<&IShellItem>) -> WinResult<()> {
+            if hr.is_ok() && recycled.is_none() {
+                self.permanent.set(true);
+            }
+            Ok(())
+        }
+        fn StartOperations(&self) -> WinResult<()> { Ok(()) }
+        fn FinishOperations(&self, _hr: HRESULT) -> WinResult<()> { Ok(()) }
+        fn PreRenameItem(&self, _f: u32, _i: Option<&IShellItem>, _n: &PCWSTR) -> WinResult<()> { Ok(()) }
+        fn PostRenameItem(&self, _f: u32, _i: Option<&IShellItem>, _n: &PCWSTR, _hr: HRESULT, _c: Option<&IShellItem>) -> WinResult<()> { Ok(()) }
+        fn PreMoveItem(&self, _f: u32, _i: Option<&IShellItem>, _d: Option<&IShellItem>, _n: &PCWSTR) -> WinResult<()> { Ok(()) }
+        fn PostMoveItem(&self, _f: u32, _i: Option<&IShellItem>, _d: Option<&IShellItem>, _n: &PCWSTR, _hr: HRESULT, _c: Option<&IShellItem>) -> WinResult<()> { Ok(()) }
+        fn PreCopyItem(&self, _f: u32, _i: Option<&IShellItem>, _d: Option<&IShellItem>, _n: &PCWSTR) -> WinResult<()> { Ok(()) }
+        fn PostCopyItem(&self, _f: u32, _i: Option<&IShellItem>, _d: Option<&IShellItem>, _n: &PCWSTR, _hr: HRESULT, _c: Option<&IShellItem>) -> WinResult<()> { Ok(()) }
+        fn PreNewItem(&self, _f: u32, _d: Option<&IShellItem>, _n: &PCWSTR) -> WinResult<()> { Ok(()) }
+        fn PostNewItem(&self, _f: u32, _d: Option<&IShellItem>, _n: &PCWSTR, _t: &PCWSTR, _a: u32, _hr: HRESULT, _c: Option<&IShellItem>) -> WinResult<()> { Ok(()) }
+        fn UpdateProgress(&self, _total: u32, _done: u32) -> WinResult<()> { Ok(()) }
+        fn ResetTimer(&self) -> WinResult<()> { Ok(()) }
+        fn PauseTimer(&self) -> WinResult<()> { Ok(()) }
+        fn ResumeTimer(&self) -> WinResult<()> { Ok(()) }
+    }
+
+    path.file_name().ok_or("Can't move a whole disk to the Recycle Bin")?;
+    let wide_path = wide(path.as_os_str());
+    unsafe {
+        // The UI thread already has COM (S_FALSE); a worker thread gets it here. Either way a
+        // successful call must be balanced. A thread set up differently (RPC_E_CHANGED_MODE)
+        // still has COM, just not ours to undo.
+        let inited = CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE).is_ok();
+        let (refused, permanent) = (Rc::new(Cell::new(false)), Rc::new(Cell::new(false)));
+        let sink: IFileOperationProgressSink = Sink { refused: refused.clone(), permanent: permanent.clone() }.into();
+        let result = (|| -> WinResult<bool> {
+            let op: IFileOperation = CoCreateInstance(&FileOperation, None, CLSCTX_ALL)?;
+            op.SetOperationFlags(FOF_NO_UI | FOF_ALLOWUNDO | FOFX_RECYCLEONDELETE | FOFX_EARLYFAILURE | FOF_NO_CONNECTED_ELEMENTS)?;
+            let item: IShellItem = SHCreateItemFromParsingName(PCWSTR(wide_path.as_ptr()), None)?;
+            op.DeleteItem(&item, &sink)?;
+            let performed = op.PerformOperations();
+            let aborted = op.GetAnyOperationsAborted().map_or(true, |b| b.as_bool());
+            performed.map(|()| !aborted)
+        })();
+        drop(sink);
+        let (refused, permanent) = (refused.get(), permanent.get());
+        if inited {
+            CoUninitialize();
+        }
+        if permanent {
+            return Err("Windows deleted it instead of moving it to the Recycle Bin.".into());
+        }
+        if refused {
+            return Err("This drive can't hold it in the Recycle Bin (no Recycle Bin here, the item is too big, or \
+                        the bin is turned off), so it was left where it is."
+                .into());
+        }
+        match result {
+            Ok(true) if !path.exists() => Ok(()),
+            Ok(_) => Err("Windows didn't move it to the Recycle Bin; it was left where it is.".into()),
+            Err(e) => Err(format!("Windows couldn't move it to the Recycle Bin ({})", e.message())),
+        }
     }
 }
 

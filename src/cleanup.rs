@@ -13,6 +13,37 @@ pub enum Kind {
     OldFiles,
     /// Empty the Trash / Recycle Bin.
     Trash,
+    /// Delete only Explorer's thumbnail cache files (thumbcache_*.db) directly in these folders.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    ThumbCache,
+}
+
+/// Explorer's thumbnail databases: `thumbcache_*.db`. Other files in that folder (icon
+/// cache, search data, …) are left alone.
+pub fn is_thumb_cache(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    n.starts_with("thumbcache_") && n.ends_with(".db")
+}
+
+fn thumb_cache_files(dirs: &[PathBuf]) -> Vec<PathBuf> {
+    let mut v = Vec::new();
+    for dir in dirs {
+        let Ok(entries) = std::fs::read_dir(dir) else { continue };
+        for e in entries.flatten() {
+            if e.file_type().map_or(false, |t| t.is_file()) && is_thumb_cache(&e.file_name().to_string_lossy()) {
+                v.push(e.path());
+            }
+        }
+    }
+    v
+}
+
+/// The order categories run in: the Trash is emptied first, so anything this same run moves to
+/// the Trash (old downloads) is still there to get back afterwards.
+pub fn run_order(kinds: &[Kind]) -> Vec<usize> {
+    let mut idx: Vec<usize> = (0..kinds.len()).collect();
+    idx.sort_by_key(|&i| kinds[i] != Kind::Trash);
+    idx
 }
 
 pub struct Category {
@@ -55,8 +86,8 @@ pub fn categories() -> Vec<Category> {
         v.push(cat("Crash dumps", "Memory dumps left by crashed apps.", Kind::Contents, vec![local.join("CrashDumps")], true));
         v.push(cat(
             "Thumbnail cache",
-            "Picture previews Explorer rebuilds when needed.",
-            Kind::Contents,
+            "Picture previews Explorer rebuilds when needed (thumbcache files only).",
+            Kind::ThumbCache,
             vec![local.join("Microsoft\\Windows\\Explorer")],
             false,
         ));
@@ -90,6 +121,14 @@ fn cutoff(days: u32) -> SystemTime {
 pub fn measure(kind: Kind, paths: &[PathBuf], days: u32) -> Option<(u64, u64)> {
     match kind {
         Kind::Trash => platform::trash_size(),
+        Kind::ThumbCache => {
+            let mut total = (0, 0);
+            for p in thumb_cache_files(paths) {
+                total.0 += crate::scan::reclaimable(&p);
+                total.1 += 1;
+            }
+            Some(total)
+        }
         Kind::OldFiles => {
             std::fs::read_dir(paths.first()?).ok()?;
             let mut total = (0, 0);
@@ -122,12 +161,15 @@ pub fn measure(kind: Kind, paths: &[PathBuf], days: u32) -> Option<(u64, u64)> {
 }
 
 pub struct Outcome {
+    /// Deleted for good: disk space given back.
     pub freed: u64,
+    /// Moved to the Trash: still on disk until the Trash is emptied.
+    pub trashed: u64,
     pub skipped: u64,
 }
 
 pub fn clean(kind: Kind, paths: &[PathBuf], days: u32) -> Outcome {
-    let mut out = Outcome { freed: 0, skipped: 0 };
+    let mut out = Outcome { freed: 0, trashed: 0, skipped: 0 };
     match kind {
         Kind::Trash => {
             let before = platform::trash_size().map_or(0, |s| s.0);
@@ -146,11 +188,16 @@ pub fn clean(kind: Kind, paths: &[PathBuf], days: u32) -> Outcome {
                 }
             }
         }
+        Kind::ThumbCache => {
+            for p in thumb_cache_files(paths) {
+                remove_tree(&p, &mut out);
+            }
+        }
         Kind::OldFiles => {
             for p in old_items(paths, cutoff(days)) {
                 let size = crate::scan::reclaimable(&p);
                 match platform::move_to_trash(&p) {
-                    Ok(()) => out.freed += size,
+                    Ok(()) => out.trashed += size,
                     Err(_) => out.skipped += 1,
                 }
             }
@@ -226,6 +273,41 @@ mod tests {
         // Freshly made files are never "old downloads".
         std::fs::write(dir.join("new.bin"), b"x").unwrap();
         assert_eq!(measure(Kind::OldFiles, &[dir.clone()], 1), Some((0, 0)));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn trash_is_emptied_before_anything_moves_into_it() {
+        let kinds = [Kind::Contents, Kind::OldFiles, Kind::Contents, Kind::Trash];
+        let order = run_order(&kinds);
+        assert!(kinds[order[0]] == Kind::Trash);
+        assert_eq!(order, vec![3, 0, 1, 2]); // the rest keep their order
+        assert_eq!(run_order(&[Kind::OldFiles]), vec![0]);
+    }
+
+    #[test]
+    fn thumb_cache_only_touches_thumbcache_files() {
+        assert!(is_thumb_cache("thumbcache_256.db"));
+        assert!(is_thumb_cache("THUMBCACHE_IDX.DB"));
+        assert!(!is_thumb_cache("iconcache_256.db"));
+        assert!(!is_thumb_cache("thumbcache_256.db.bak"));
+        assert!(!is_thumb_cache("ExplorerStartupLog.etl"));
+
+        let dir = std::env::current_dir().unwrap().join("target/scratch-thumbcache");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("thumbcache_sub")).unwrap();
+        std::fs::write(dir.join("thumbcache_96.db"), vec![1u8; 5_000]).unwrap();
+        std::fs::write(dir.join("iconcache_96.db"), b"keep").unwrap();
+        std::fs::write(dir.join("other.txt"), b"keep").unwrap();
+        std::fs::write(dir.join("thumbcache_sub/thumbcache_1.db"), b"keep").unwrap();
+        let (_, files) = measure(Kind::ThumbCache, &[dir.clone()], 30).unwrap();
+        assert_eq!(files, 1);
+        let out = clean(Kind::ThumbCache, &[dir.clone()], 30);
+        assert_eq!(out.skipped, 0);
+        assert!(!dir.join("thumbcache_96.db").exists());
+        for keep in ["iconcache_96.db", "other.txt", "thumbcache_sub/thumbcache_1.db"] {
+            assert!(dir.join(keep).exists(), "{keep} should be untouched");
+        }
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
