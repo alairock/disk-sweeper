@@ -133,8 +133,7 @@ pub struct App {
     cats: Vec<Category>,
     old_days: u32,
     measuring: Option<Receiver<Vec<Option<(u64, u64)>>>>,
-    /// (freed, moved to the Trash, skipped).
-    cleaning: Option<Receiver<(u64, u64, u64)>>,
+    cleaning: Option<Receiver<cleanup::Outcome>>,
     last_clean: Option<String>,
     cleaned_paths: Vec<PathBuf>,
     shot: Option<Shot>,
@@ -389,7 +388,7 @@ impl App {
         let (tx, rx) = channel();
         std::thread::spawn(move || {
             let o = cleanup::clean(cleanup::Kind::Trash, &[], 0);
-            let _ = tx.send((o.freed, o.trashed, o.skipped));
+            let _ = tx.send(o);
         });
         self.cleaning = Some(rx);
     }
@@ -432,14 +431,14 @@ impl App {
         let days = self.old_days;
         let (tx, rx) = channel();
         std::thread::spawn(move || {
-            let (mut freed, mut trashed, mut skipped) = (0, 0, 0);
+            let mut total = cleanup::Outcome::default();
             for (k, p) in &jobs {
-                let o = cleanup::clean(*k, p, days);
-                freed += o.freed;
-                trashed += o.trashed;
-                skipped += o.skipped;
+                total.add(cleanup::clean(*k, p, days));
+                if total.error.is_some() {
+                    break; // something was lost for good: don't touch anything else
+                }
             }
-            let _ = tx.send((freed, trashed, skipped));
+            let _ = tx.send(total);
         });
         self.cleaning = Some(rx);
     }
@@ -522,7 +521,7 @@ impl App {
             }
         }
         if let Some(rx) = &self.cleaning {
-            if let Ok((freed, trashed, skipped)) = rx.try_recv() {
+            if let Ok(cleanup::Outcome { freed, trashed, skipped, error }) = rx.try_recv() {
                 let mut text = format!("Done — freed {}.", human(freed));
                 if trashed > 0 {
                     text += &format!(
@@ -532,9 +531,15 @@ impl App {
                     );
                 }
                 if skipped > 0 {
-                    text += &format!(" {skipped} item(s) were in use or protected and were left alone.");
+                    text += &format!(
+                        " {skipped} item(s) couldn't be removed or safely moved to the {} (in use or protected) and were left alone.",
+                        platform::TRASH_NAME
+                    );
                 }
-                if skipped > 0 && freed == 0 && trashed == 0 {
+                if let Some(e) = error {
+                    text = format!("{e} {text}");
+                    self.message = Some((text.clone(), false));
+                } else if skipped > 0 && freed == 0 && trashed == 0 {
                     self.message = Some(("Nothing could be removed — the system blocked it.".into(), false));
                 } else {
                     self.message = Some((text.clone(), true));

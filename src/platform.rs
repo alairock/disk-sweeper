@@ -286,13 +286,125 @@ fn wide(s: &std::ffi::OsStr) -> Vec<u16> {
     s.encode_wide().chain(std::iter::once(0)).collect()
 }
 
+/// The error `move_to_trash` returns when Windows deleted an item for good instead of
+/// recycling it. Callers must show it and stop; it is never just a skipped item.
+pub const DELETED_NOT_RECYCLED: &str =
+    "Windows deleted an item permanently instead of moving it to the Recycle Bin. Disk Sweeper stopped.";
+
+/// What Windows says about one drive's Recycle Bin, gathered before moving an item there.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub struct RecycleFacts {
+    /// A fixed local drive (not removable, network, optical or RAM disk).
+    pub fixed: bool,
+    /// SHQueryRecycleBinW answered for the drive.
+    pub bin_answers: bool,
+    /// The "don't move files to the Recycle Bin" policy is on.
+    pub no_recycle_policy: bool,
+    /// The drive's "remove files immediately" setting (None = couldn't read it).
+    pub nuke_on_delete: Option<u32>,
+    /// The drive's Recycle Bin size limit in MB (None = couldn't read it).
+    pub max_capacity_mb: Option<u32>,
+    /// A size limit set by policy, in bytes.
+    pub policy_cap: Option<u64>,
+    /// Bytes the item takes.
+    pub size: u64,
+}
+
+/// Ok only when everything says the item will land in the Recycle Bin; anything unknown refuses.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn recycle_verdict(f: &RecycleFacts) -> Result<(), String> {
+    let fix = "It was left where it is; delete it in Explorer if you're sure.";
+    if !f.fixed {
+        return Err(format!("This drive has no Recycle Bin (removable or network drive). {fix}"));
+    }
+    if !f.bin_answers {
+        return Err(format!("Windows didn't confirm this drive has a Recycle Bin. {fix}"));
+    }
+    if f.no_recycle_policy || f.nuke_on_delete.map_or(false, |n| n != 0) {
+        return Err(format!("The Recycle Bin is set to delete files immediately. {fix}"));
+    }
+    let (Some(mb), Some(_)) = (f.max_capacity_mb, f.nuke_on_delete) else {
+        return Err(format!(
+            "Couldn't read this drive's Recycle Bin settings (opening Recycle Bin › Properties once sets them up). {fix}"
+        ));
+    };
+    let cap = (mb as u64 * 1024 * 1024).min(f.policy_cap.unwrap_or(u64::MAX));
+    if f.size >= cap {
+        return Err(format!("It's too big for this drive's Recycle Bin. {fix}"));
+    }
+    Ok(())
+}
+
 /// Move a file or folder to the Trash / Recycle Bin so it can be restored.
 ///
-/// Windows: uses IFileOperation with "recycle on delete" and a progress sink that vetoes any
-/// delete Windows says it can't recycle (drive without a Recycle Bin, item too big, bin turned
-/// off). Then the item stays where it is and an error comes back; it is never deleted for good.
+/// Windows can't strictly promise to recycle, so this is defensive: it runs on its own
+/// single-threaded-apartment thread (refusing if COM won't set up that way), first checks the
+/// drive's Recycle Bin can take the item (refusing when unsure), vetoes any delete Windows
+/// announces as non-recycling, and reports `DELETED_NOT_RECYCLED` if one happens anyway.
 #[cfg(windows)]
 pub fn move_to_trash(path: &Path) -> Result<(), String> {
+    path.file_name().ok_or("Can't move a whole disk to the Recycle Bin")?;
+    let p = path.to_path_buf();
+    std::thread::spawn(move || recycle_on_sta_thread(&p))
+        .join()
+        .unwrap_or_else(|_| Err("Moving to the Recycle Bin failed unexpectedly; nothing was changed.".into()))
+}
+
+#[cfg(windows)]
+fn recycle_facts(path: &Path) -> RecycleFacts {
+    use windows_sys::Win32::Storage::FileSystem::{GetDriveTypeW, GetVolumeNameForVolumeMountPointW, GetVolumePathNameW};
+    use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD};
+    use windows_sys::Win32::UI::Shell::{SHQueryRecycleBinW, SHQUERYRBINFO};
+    const DRIVE_FIXED: u32 = 3;
+    fn dword(root: HKEY, key: &str, value: &str) -> Option<u32> {
+        let (k, v) = (wide(key.as_ref()), wide(value.as_ref()));
+        let mut data = 0u32;
+        let mut len = 4u32;
+        let r = unsafe {
+            RegGetValueW(root, k.as_ptr(), v.as_ptr(), RRF_RT_REG_DWORD, std::ptr::null_mut(), &mut data as *mut u32 as _, &mut len)
+        };
+        (r == 0).then_some(data)
+    }
+    let mut f = RecycleFacts {
+        fixed: false,
+        bin_answers: false,
+        no_recycle_policy: false,
+        nuke_on_delete: None,
+        max_capacity_mb: None,
+        policy_cap: None,
+        size: crate::scan::size_of(path, None).0,
+    };
+    let w = wide(path.as_os_str());
+    let mut root = [0u16; 512];
+    if unsafe { GetVolumePathNameW(w.as_ptr(), root.as_mut_ptr(), root.len() as u32) } == 0 {
+        return f;
+    }
+    f.fixed = unsafe { GetDriveTypeW(root.as_ptr()) } == DRIVE_FIXED;
+    let mut info: SHQUERYRBINFO = unsafe { std::mem::zeroed() };
+    info.cbSize = std::mem::size_of::<SHQUERYRBINFO>() as u32;
+    f.bin_answers = unsafe { SHQueryRecycleBinW(root.as_ptr(), &mut info) } == 0;
+    let policies = r"Software\Microsoft\Windows\CurrentVersion\Policies\Explorer";
+    f.no_recycle_policy = [HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE].iter().any(|&h| dword(h, policies, "NoRecycleFiles") == Some(1));
+    if let Some(pct) = [HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE].iter().find_map(|&h| dword(h, policies, "RecycleBinSize")) {
+        let root_path = PathBuf::from(String::from_utf16_lossy(&root[..root.iter().position(|&c| c == 0).unwrap_or(0)]));
+        f.policy_cap = Some(space(&root_path).map_or(0, |(total, _)| total / 100 * pct as u64));
+    }
+    // Per-drive settings live under the volume's GUID: "\\?\Volume{GUID}\" → "{GUID}".
+    let mut vol = [0u16; 64];
+    if unsafe { GetVolumeNameForVolumeMountPointW(root.as_ptr(), vol.as_mut_ptr(), vol.len() as u32) } != 0 {
+        let name = String::from_utf16_lossy(&vol[..vol.iter().position(|&c| c == 0).unwrap_or(0)]);
+        if let (Some(a), Some(b)) = (name.find('{'), name.rfind('}')) {
+            let key = format!(r"Software\Microsoft\Windows\CurrentVersion\Explorer\BitBucket\Volume\{}", &name[a..=b]);
+            f.max_capacity_mb = dword(HKEY_CURRENT_USER, &key, "MaxCapacity");
+            // Only read once the drive's settings exist; an absent value means the default (recycle).
+            f.nuke_on_delete = f.max_capacity_mb.map(|_| dword(HKEY_CURRENT_USER, &key, "NukeOnDelete").unwrap_or(0));
+        }
+    }
+    f
+}
+
+#[cfg(windows)]
+fn recycle_on_sta_thread(path: &Path) -> Result<(), String> {
     use std::cell::Cell;
     use std::rc::Rc;
     use windows::core::{implement, Result as WinResult, HRESULT, PCWSTR};
@@ -326,6 +438,7 @@ pub fn move_to_trash(path: &Path) -> Result<(), String> {
         fn PostDeleteItem(&self, _f: u32, _item: Option<&IShellItem>, hr: HRESULT, recycled: Option<&IShellItem>) -> WinResult<()> {
             if hr.is_ok() && recycled.is_none() {
                 self.permanent.set(true);
+                return Err(E_ABORT.into()); // stop anything else in this operation
             }
             Ok(())
         }
@@ -345,43 +458,42 @@ pub fn move_to_trash(path: &Path) -> Result<(), String> {
         fn ResumeTimer(&self) -> WinResult<()> { Ok(()) }
     }
 
-    path.file_name().ok_or("Can't move a whole disk to the Recycle Bin")?;
-    let wide_path = wide(path.as_os_str());
-    unsafe {
-        // The UI thread already has COM (S_FALSE); a worker thread gets it here. Either way a
-        // successful call must be balanced. A thread set up differently (RPC_E_CHANGED_MODE)
-        // still has COM, just not ours to undo.
-        let inited = CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE).is_ok();
+    // IFileOperation needs a single-threaded apartment. This thread is new, so anything other
+    // than a clean STA setup (RPC_E_CHANGED_MODE included) means something is off: refuse.
+    if unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) }.is_err() {
+        return Err("Couldn't prepare Windows' file operation, so nothing was moved.".into());
+    }
+    let outcome = (|| {
+        recycle_verdict(&recycle_facts(path))?;
+        let wide_path = wide(path.as_os_str());
         let (refused, permanent) = (Rc::new(Cell::new(false)), Rc::new(Cell::new(false)));
         let sink: IFileOperationProgressSink = Sink { refused: refused.clone(), permanent: permanent.clone() }.into();
-        let result = (|| -> WinResult<bool> {
-            let op: IFileOperation = CoCreateInstance(&FileOperation, None, CLSCTX_ALL)?;
-            op.SetOperationFlags(FOF_NO_UI | FOF_ALLOWUNDO | FOFX_RECYCLEONDELETE | FOFX_EARLYFAILURE | FOF_NO_CONNECTED_ELEMENTS)?;
-            let item: IShellItem = SHCreateItemFromParsingName(PCWSTR(wide_path.as_ptr()), None)?;
-            op.DeleteItem(&item, &sink)?;
-            let performed = op.PerformOperations();
-            let aborted = op.GetAnyOperationsAborted().map_or(true, |b| b.as_bool());
-            performed.map(|()| !aborted)
-        })();
+        let result = unsafe {
+            (|| -> WinResult<bool> {
+                let op: IFileOperation = CoCreateInstance(&FileOperation, None, CLSCTX_ALL)?;
+                op.SetOperationFlags(FOF_NO_UI | FOF_ALLOWUNDO | FOFX_RECYCLEONDELETE | FOFX_EARLYFAILURE | FOF_NO_CONNECTED_ELEMENTS)?;
+                let item: IShellItem = SHCreateItemFromParsingName(PCWSTR(wide_path.as_ptr()), None)?;
+                op.DeleteItem(&item, &sink)?;
+                let performed = op.PerformOperations();
+                let aborted = op.GetAnyOperationsAborted().map_or(true, |b| b.as_bool());
+                performed.map(|()| !aborted)
+            })()
+        };
         drop(sink);
-        let (refused, permanent) = (refused.get(), permanent.get());
-        if inited {
-            CoUninitialize();
+        if permanent.get() {
+            return Err(DELETED_NOT_RECYCLED.to_string());
         }
-        if permanent {
-            return Err("Windows deleted it instead of moving it to the Recycle Bin.".into());
-        }
-        if refused {
-            return Err("This drive can't hold it in the Recycle Bin (no Recycle Bin here, the item is too big, or \
-                        the bin is turned off), so it was left where it is."
-                .into());
+        if refused.get() {
+            return Err("Windows said it couldn't recycle this, so it was left where it is.".into());
         }
         match result {
             Ok(true) if !path.exists() => Ok(()),
             Ok(_) => Err("Windows didn't move it to the Recycle Bin; it was left where it is.".into()),
             Err(e) => Err(format!("Windows couldn't move it to the Recycle Bin ({})", e.message())),
         }
-    }
+    })();
+    unsafe { CoUninitialize() };
+    outcome
 }
 
 #[cfg(unix)]
@@ -638,6 +750,39 @@ pub fn delete_sim_runtime(id: &str) -> Result<(), String> {
     } else {
         let why = String::from_utf8_lossy(&out.stderr).trim().to_string();
         Err(format!("Xcode's simulator tool couldn't remove it. {why}"))
+    }
+}
+
+#[cfg(test)]
+mod recycle_tests {
+    use super::*;
+
+    fn ok_facts() -> RecycleFacts {
+        RecycleFacts {
+            fixed: true,
+            bin_answers: true,
+            no_recycle_policy: false,
+            nuke_on_delete: Some(0),
+            max_capacity_mb: Some(10_000),
+            policy_cap: None,
+            size: 5_000_000,
+        }
+    }
+
+    #[test]
+    fn recycles_only_when_everything_checks_out() {
+        assert!(recycle_verdict(&ok_facts()).is_ok());
+        let refused = |f: RecycleFacts| assert!(recycle_verdict(&f).is_err());
+        refused(RecycleFacts { fixed: false, ..ok_facts() });
+        refused(RecycleFacts { bin_answers: false, ..ok_facts() });
+        refused(RecycleFacts { no_recycle_policy: true, ..ok_facts() });
+        refused(RecycleFacts { nuke_on_delete: Some(1), ..ok_facts() });
+        // Unknown settings refuse rather than guess.
+        refused(RecycleFacts { nuke_on_delete: None, ..ok_facts() });
+        refused(RecycleFacts { max_capacity_mb: None, ..ok_facts() });
+        // Too big for the bin (its own limit, or a policy limit).
+        refused(RecycleFacts { size: 10_000 * 1024 * 1024, ..ok_facts() });
+        refused(RecycleFacts { policy_cap: Some(1_000_000), ..ok_facts() });
     }
 }
 

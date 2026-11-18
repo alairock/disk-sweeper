@@ -160,16 +160,31 @@ pub fn measure(kind: Kind, paths: &[PathBuf], days: u32) -> Option<(u64, u64)> {
     }
 }
 
+#[derive(Default)]
 pub struct Outcome {
     /// Deleted for good: disk space given back.
     pub freed: u64,
     /// Moved to the Trash: still on disk until the Trash is emptied.
     pub trashed: u64,
     pub skipped: u64,
+    /// Something went wrong that the person must see, and cleanup stopped
+    /// (an item was deleted for good instead of going to the Trash).
+    pub error: Option<String>,
+}
+
+impl Outcome {
+    pub fn add(&mut self, o: Outcome) {
+        self.freed += o.freed;
+        self.trashed += o.trashed;
+        self.skipped += o.skipped;
+        if self.error.is_none() {
+            self.error = o.error;
+        }
+    }
 }
 
 pub fn clean(kind: Kind, paths: &[PathBuf], days: u32) -> Outcome {
-    let mut out = Outcome { freed: 0, trashed: 0, skipped: 0 };
+    let mut out = Outcome::default();
     match kind {
         Kind::Trash => {
             let before = platform::trash_size().map_or(0, |s| s.0);
@@ -190,7 +205,7 @@ pub fn clean(kind: Kind, paths: &[PathBuf], days: u32) -> Outcome {
         }
         Kind::ThumbCache => {
             for p in thumb_cache_files(paths) {
-                remove_tree(&p, &mut out);
+                remove_file_only(&p, &mut out);
             }
         }
         Kind::OldFiles => {
@@ -198,6 +213,10 @@ pub fn clean(kind: Kind, paths: &[PathBuf], days: u32) -> Outcome {
                 let size = crate::scan::reclaimable(&p);
                 match platform::move_to_trash(&p) {
                     Ok(()) => out.trashed += size,
+                    Err(e) if e == platform::DELETED_NOT_RECYCLED => {
+                        out.error = Some(format!("{e} It was “{}”.", p.display()));
+                        break;
+                    }
                     Err(_) => out.skipped += 1,
                 }
             }
@@ -230,6 +249,16 @@ fn has_recent(path: &Path, limit: SystemTime) -> bool {
     }
     md.is_dir()
         && std::fs::read_dir(path).map_or(true, |es| es.flatten().any(|e| has_recent(&e.path(), limit)))
+}
+
+/// Delete one file. Never recurses: if something swapped a folder in at this path since it was
+/// listed, removing it fails and it's counted as skipped.
+fn remove_file_only(path: &Path, out: &mut Outcome) {
+    let size = crate::scan::reclaimable(path);
+    match std::fs::remove_file(path) {
+        Ok(()) => out.freed += size,
+        Err(_) => out.skipped += 1,
+    }
 }
 
 /// Delete a file or folder; files that are in use or protected are skipped.
@@ -308,6 +337,13 @@ mod tests {
         for keep in ["iconcache_96.db", "other.txt", "thumbcache_sub/thumbcache_1.db"] {
             assert!(dir.join(keep).exists(), "{keep} should be untouched");
         }
+        // A folder swapped in under a matching name after listing is never emptied.
+        std::fs::create_dir_all(dir.join("thumbcache_x.db")).unwrap();
+        std::fs::write(dir.join("thumbcache_x.db/precious.txt"), b"keep").unwrap();
+        let mut out = Outcome::default();
+        remove_file_only(&dir.join("thumbcache_x.db"), &mut out);
+        assert_eq!((out.freed, out.skipped), (0, 1));
+        assert!(dir.join("thumbcache_x.db/precious.txt").exists());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

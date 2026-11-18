@@ -44,17 +44,21 @@ The screenshots use made-up demo data (see [Screenshots](#screenshots)).
 | --- | --- |
 | macOS 11+ (Apple Silicon) | Main development platform. |
 | macOS (Intel) | Should work; not tested. |
-| Windows 10/11 (x86_64) | Supported; release builds are cross-compiled from macOS. A native Windows build hasn't been tested. |
+| Windows 10/11 (x86_64) | Builds (cross-compiled from macOS), but untested on Windows. See the Recycle Bin note below. |
 | Linux | Some code paths exist, but it isn't supported or tested. |
 
 Limitations:
 
 - Without Full Disk Access on macOS (or administrator rights on Windows), protected folders count
   as zero, so totals come up short. The app lists the folders it couldn't read.
-- On Windows, "Move to Recycle Bin" never falls back to deleting for good: if a drive has no
-  Recycle Bin, the item is too large for it, or the bin is turned off, the item stays in place and
-  the app shows an error. (Implemented with IFileOperation; not yet tested on a real Windows
-  machine.)
+- **Windows support is untested on real Windows machines.** Windows can't strictly guarantee that
+  a delete goes to the Recycle Bin, so Disk Sweeper is defensive: it refuses to move an item
+  unless it can confirm the item will go to the Recycle Bin. It checks for a fixed local drive with
+  a Recycle Bin, that "delete immediately" is off (including by policy), and that the item fits the
+  bin's size limit. If any of these is unknown, the item is left where it is and you get an error;
+  delete it in Explorer if you're sure. It also vetoes any delete Windows announces as
+  non-recycling. If Windows deletes something permanently anyway, the app shows an error and
+  stops the rest of the cleanup.
 - macOS protects some files (such as parts of Xcode simulators) so that they can't be moved to the
   Trash. For simulator runtimes the app offers to remove them through Xcode's own tool instead.
 - Sizes are estimates when files share space on disk (APFS clones; on Windows, hard links among
