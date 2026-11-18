@@ -12,8 +12,9 @@ CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUSTFLAGS="-C dlltool=$TOOLS/zig-dlltool.sh" 
 mkdir -p dist
 APP="dist/Disk Sweeper.app/Contents"
 rm -rf "dist/Disk Sweeper.app"
-mkdir -p "$APP/MacOS"
+mkdir -p "$APP/MacOS" "$APP/Resources"
 cp target/release/disk-sweeper "$APP/MacOS/Disk Sweeper"
+cp assets/AppIcon.icns "$APP/Resources/AppIcon.icns"
 cat > "$APP/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -22,6 +23,7 @@ cat > "$APP/Info.plist" <<PLIST
   <key>CFBundleDisplayName</key><string>Disk Sweeper</string>
   <key>CFBundleIdentifier</key><string>local.disksweeper</string>
   <key>CFBundleExecutable</key><string>Disk Sweeper</string>
+  <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>0.1.0</string>
   <key>NSHighResolutionCapable</key><true/>

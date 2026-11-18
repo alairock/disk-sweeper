@@ -1,3 +1,5 @@
+<p align="center"><img src="assets/icon.svg" width="112" alt="Disk Sweeper icon"></p>
+
 # Disk Sweeper
 
 A small desktop app for macOS and Windows that shows what is using your disk and lets you clear
@@ -109,6 +111,14 @@ You can put the same settings in a local, untracked `.cargo/config.toml` if you 
 
 On Windows you can build natively with `cargo build --release` (MSVC toolchain). This hasn't been
 tested.
+
+### Icons
+
+`assets/icon.svg` is the source for every icon. `tools/make-icons.sh` renders each size from it:
+the macOS `assets/AppIcon.icns`, the Windows `assets/icon.ico`, and the in-app logo bitmaps in
+`assets/ui/`. It needs resvg, ImageMagick and `iconutil`. The generated files are committed, so a
+normal build doesn't need those tools. On Windows, `build.rs` embeds `assets/icon.ico` into the
+.exe without a resource compiler.
 
 ### Signing (macOS)
 

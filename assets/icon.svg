@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 128 128" role="img" aria-label="Disk Sweeper · Partition D">
+  <title>Disk Sweeper · Partition D</title>
+  <defs>
+    <linearGradient id="ground" x2="0.8" y2="1"><stop stop-color="#303949"/><stop offset="1" stop-color="#17191F"/></linearGradient>
+    <linearGradient id="blue" x2="0.8" y2="1"><stop stop-color="#77C5FF"/><stop offset="1" stop-color="#4F9DFF"/></linearGradient>
+    <linearGradient id="violet" x2="0.8" y2="1"><stop stop-color="#C6A5FF"/><stop offset="1" stop-color="#9B6CF6"/></linearGradient>
+    <linearGradient id="mint" x2="0.8" y2="1"><stop stop-color="#87EDC0"/><stop offset="1" stop-color="#3DC98A"/></linearGradient>
+  </defs>
+  <path d="M43 13H85C95 13 100 13 105 16C109 18 112 22 113.5 27C115 32 115 37 115 43V85C115 95 115 100 112 105C110 109 106 112 101 113.5C96 115 91 115 85 115H43C33 115 28 115 23 112C19 110 16 106 14.5 101C13 96 13 91 13 85V43C13 33 13 28 16 23C18 19 22 16 27 14.5C32 13 37 13 43 13Z" fill="url(#ground)"/>
+  <!-- Three partitions share the outside contour of a D. The open middle is free space. -->
+  <path fill="url(#blue)" d="M36 30H60V98H36Q32 98 32 94V34Q32 30 36 30Z"/>
+  <path fill="url(#violet)" d="M65 30C84 30 98 42 99 61H81C80 52 74 48 65 48Z"/>
+  <path fill="url(#mint)" d="M81 66H99C98 85 85 98 65 98V80C74 80 80 75 81 66Z"/>
+</svg>

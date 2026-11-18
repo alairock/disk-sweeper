@@ -9,6 +9,18 @@ mod treemap;
 
 use std::path::PathBuf;
 
+/// The window/taskbar icon: the full macOS-style icon on a Mac, the tile on Windows.
+fn window_icon() -> egui::IconData {
+    let png: &[u8] = if cfg!(target_os = "macos") {
+        include_bytes!("../assets/icon-256.png")
+    } else {
+        include_bytes!("../assets/ui/logo-256.png")
+    };
+    let img = image::load_from_memory(png).expect("embedded icon").into_rgba8();
+    let (width, height) = img.dimensions();
+    egui::IconData { rgba: img.into_raw(), width, height }
+}
+
 fn main() -> eframe::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let shot: Option<PathBuf> = args
@@ -30,7 +42,8 @@ fn main() -> eframe::Result<()> {
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("Disk Sweeper")
         .with_inner_size([1180.0, 760.0])
-        .with_min_inner_size([820.0, 520.0]);
+        .with_min_inner_size([820.0, 520.0])
+        .with_icon(window_icon());
 
     let mut options = eframe::NativeOptions::default();
     if shot.is_some() {

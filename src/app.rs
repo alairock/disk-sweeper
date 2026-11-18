@@ -1923,13 +1923,28 @@ fn ring(ui: &mut Ui, rect: Rect, id: &Path, frac: f32) {
     p.text(c, Align2::CENTER_CENTER, format!("{:.0}%", frac * 100.0), FontId::proportional(17.0), TEXT);
 }
 
+/// The app's mark, drawn from the bitmap rendered for (at least) its on-screen pixel size, so
+/// it stays sharp at 1x, 2x and 3x.
 fn logo(ui: &mut Ui, r: Rect) {
-    let p = ui.painter();
-    p.rect_filled(r, 7.0, ACCENT);
-    let c = r.center();
-    p.circle_stroke(c, 8.0, Stroke::new(2.5, Color32::WHITE));
-    p.line_segment([c, c + vec2(0.0, -8.0)], Stroke::new(2.5, Color32::WHITE));
-    p.circle_filled(c, 2.5, Color32::WHITE);
+    const SIZES: [(u32, &[u8]); 6] = [
+        (28, include_bytes!("../assets/ui/logo-28.png")),
+        (56, include_bytes!("../assets/ui/logo-56.png")),
+        (84, include_bytes!("../assets/ui/logo-84.png")),
+        (112, include_bytes!("../assets/ui/logo-112.png")),
+        (168, include_bytes!("../assets/ui/logo-168.png")),
+        (256, include_bytes!("../assets/ui/logo-256.png")),
+    ];
+    let px = (r.width() * ui.ctx().pixels_per_point()).ceil() as u32;
+    let (size, png) = SIZES.iter().find(|(s, _)| *s >= px).unwrap_or(&SIZES[SIZES.len() - 1]);
+    let id = egui::Id::new(("logo", *size));
+    let tex = ui.ctx().data_mut(|d| d.get_temp::<egui::TextureHandle>(id)).unwrap_or_else(|| {
+        let img = image::load_from_memory(png).expect("embedded logo").into_rgba8();
+        let color = egui::ColorImage::from_rgba_unmultiplied([img.width() as usize, img.height() as usize], img.as_raw());
+        let tex = ui.ctx().load_texture(format!("logo-{size}"), color, egui::TextureOptions::LINEAR);
+        ui.ctx().data_mut(|d| d.insert_temp(id, tex.clone()));
+        tex
+    });
+    ui.painter().image(tex.id(), r, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
 }
 
 fn empty_state(ui: &mut Ui, title: &str, sub: &str) {
