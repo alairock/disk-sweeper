@@ -306,8 +306,37 @@ pub struct RecycleFacts {
     pub max_capacity_mb: Option<u32>,
     /// A size limit set by policy, in bytes.
     pub policy_cap: Option<u64>,
-    /// Bytes the item takes.
-    pub size: u64,
+    /// A setting couldn't be read for a reason other than "not set" (e.g. access denied).
+    pub unreadable: bool,
+    /// Bytes the item takes (None = some part of it couldn't be measured).
+    pub size: Option<u64>,
+}
+
+/// A registry DWORD read: the value, None when it simply isn't set (ERROR_FILE_NOT_FOUND),
+/// or Err for any other failure, which callers must treat as "unknown", never as "not set".
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn reg_dword_result(code: u32, data: u32) -> Result<Option<u32>, u32> {
+    const ERROR_FILE_NOT_FOUND: u32 = 2;
+    match code {
+        0 => Ok(Some(data)),
+        ERROR_FILE_NOT_FOUND => Ok(None),
+        e => Err(e),
+    }
+}
+
+/// Logical size of a file or folder, failing if any part can't be read (no guessing).
+/// Links and junctions count as themselves and aren't followed.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn strict_size(path: &Path) -> std::io::Result<u64> {
+    let md = std::fs::symlink_metadata(path)?;
+    if !md.is_dir() {
+        return Ok(md.len());
+    }
+    let mut total = 0;
+    for e in std::fs::read_dir(path)? {
+        total += strict_size(&e?.path())?;
+    }
+    Ok(total)
 }
 
 /// Ok only when everything says the item will land in the Recycle Bin; anything unknown refuses.
@@ -320,6 +349,9 @@ pub fn recycle_verdict(f: &RecycleFacts) -> Result<(), String> {
     if !f.bin_answers {
         return Err(format!("Windows didn't confirm this drive has a Recycle Bin. {fix}"));
     }
+    if f.unreadable {
+        return Err(format!("Couldn't read this drive's Recycle Bin settings or policies. {fix}"));
+    }
     if f.no_recycle_policy || f.nuke_on_delete.map_or(false, |n| n != 0) {
         return Err(format!("The Recycle Bin is set to delete files immediately. {fix}"));
     }
@@ -328,8 +360,11 @@ pub fn recycle_verdict(f: &RecycleFacts) -> Result<(), String> {
             "Couldn't read this drive's Recycle Bin settings (opening Recycle Bin › Properties once sets them up). {fix}"
         ));
     };
+    let Some(size) = f.size else {
+        return Err(format!("Couldn't measure all of it to check it fits in the Recycle Bin. {fix}"));
+    };
     let cap = (mb as u64 * 1024 * 1024).min(f.policy_cap.unwrap_or(u64::MAX));
-    if f.size >= cap {
+    if size >= cap {
         return Err(format!("It's too big for this drive's Recycle Bin. {fix}"));
     }
     Ok(())
@@ -356,14 +391,18 @@ fn recycle_facts(path: &Path) -> RecycleFacts {
     use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD};
     use windows_sys::Win32::UI::Shell::{SHQueryRecycleBinW, SHQUERYRBINFO};
     const DRIVE_FIXED: u32 = 3;
-    fn dword(root: HKEY, key: &str, value: &str) -> Option<u32> {
+    // Missing → Ok(None); any other failure flags the facts unreadable (so the move is refused).
+    fn dword(f: &mut RecycleFacts, root: HKEY, key: &str, value: &str) -> Option<u32> {
         let (k, v) = (wide(key.as_ref()), wide(value.as_ref()));
         let mut data = 0u32;
         let mut len = 4u32;
         let r = unsafe {
             RegGetValueW(root, k.as_ptr(), v.as_ptr(), RRF_RT_REG_DWORD, std::ptr::null_mut(), &mut data as *mut u32 as _, &mut len)
         };
-        (r == 0).then_some(data)
+        reg_dword_result(r, data).unwrap_or_else(|_| {
+            f.unreadable = true;
+            None
+        })
     }
     let mut f = RecycleFacts {
         fixed: false,
@@ -372,7 +411,8 @@ fn recycle_facts(path: &Path) -> RecycleFacts {
         nuke_on_delete: None,
         max_capacity_mb: None,
         policy_cap: None,
-        size: crate::scan::size_of(path, None).0,
+        unreadable: false,
+        size: strict_size(path).ok(),
     };
     let w = wide(path.as_os_str());
     let mut root = [0u16; 512];
@@ -384,8 +424,15 @@ fn recycle_facts(path: &Path) -> RecycleFacts {
     info.cbSize = std::mem::size_of::<SHQUERYRBINFO>() as u32;
     f.bin_answers = unsafe { SHQueryRecycleBinW(root.as_ptr(), &mut info) } == 0;
     let policies = r"Software\Microsoft\Windows\CurrentVersion\Policies\Explorer";
-    f.no_recycle_policy = [HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE].iter().any(|&h| dword(h, policies, "NoRecycleFiles") == Some(1));
-    if let Some(pct) = [HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE].iter().find_map(|&h| dword(h, policies, "RecycleBinSize")) {
+    for h in [HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE] {
+        if dword(&mut f, h, policies, "NoRecycleFiles").map_or(false, |v| v != 0) {
+            f.no_recycle_policy = true;
+        }
+    }
+    // A size policy can be set per user and per machine: the smaller one wins.
+    let pcts: Vec<u32> =
+        [HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE].into_iter().filter_map(|h| dword(&mut f, h, policies, "RecycleBinSize")).collect();
+    if let Some(&pct) = pcts.iter().min() {
         let root_path = PathBuf::from(String::from_utf16_lossy(&root[..root.iter().position(|&c| c == 0).unwrap_or(0)]));
         f.policy_cap = Some(space(&root_path).map_or(0, |(total, _)| total / 100 * pct as u64));
     }
@@ -395,9 +442,11 @@ fn recycle_facts(path: &Path) -> RecycleFacts {
         let name = String::from_utf16_lossy(&vol[..vol.iter().position(|&c| c == 0).unwrap_or(0)]);
         if let (Some(a), Some(b)) = (name.find('{'), name.rfind('}')) {
             let key = format!(r"Software\Microsoft\Windows\CurrentVersion\Explorer\BitBucket\Volume\{}", &name[a..=b]);
-            f.max_capacity_mb = dword(HKEY_CURRENT_USER, &key, "MaxCapacity");
+            f.max_capacity_mb = dword(&mut f, HKEY_CURRENT_USER, &key, "MaxCapacity");
             // Only read once the drive's settings exist; an absent value means the default (recycle).
-            f.nuke_on_delete = f.max_capacity_mb.map(|_| dword(HKEY_CURRENT_USER, &key, "NukeOnDelete").unwrap_or(0));
+            if f.max_capacity_mb.is_some() {
+                f.nuke_on_delete = Some(dword(&mut f, HKEY_CURRENT_USER, &key, "NukeOnDelete").unwrap_or(0));
+            }
         }
     }
     f
@@ -765,7 +814,8 @@ mod recycle_tests {
             nuke_on_delete: Some(0),
             max_capacity_mb: Some(10_000),
             policy_cap: None,
-            size: 5_000_000,
+            unreadable: false,
+            size: Some(5_000_000),
         }
     }
 
@@ -781,8 +831,38 @@ mod recycle_tests {
         refused(RecycleFacts { nuke_on_delete: None, ..ok_facts() });
         refused(RecycleFacts { max_capacity_mb: None, ..ok_facts() });
         // Too big for the bin (its own limit, or a policy limit).
-        refused(RecycleFacts { size: 10_000 * 1024 * 1024, ..ok_facts() });
+        refused(RecycleFacts { size: Some(10_000 * 1024 * 1024), ..ok_facts() });
         refused(RecycleFacts { policy_cap: Some(1_000_000), ..ok_facts() });
+        // A setting that couldn't be read, or an item that couldn't be fully measured.
+        refused(RecycleFacts { unreadable: true, ..ok_facts() });
+        refused(RecycleFacts { size: None, ..ok_facts() });
+    }
+
+    #[test]
+    fn registry_errors_are_not_treated_as_unset() {
+        assert_eq!(reg_dword_result(0, 7), Ok(Some(7)));
+        assert_eq!(reg_dword_result(2, 0), Ok(None)); // ERROR_FILE_NOT_FOUND: not set
+        assert_eq!(reg_dword_result(5, 0), Err(5)); // ERROR_ACCESS_DENIED
+        assert_eq!(reg_dword_result(13, 0), Err(13)); // ERROR_INVALID_DATA (wrong type)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn strict_size_fails_on_anything_unreadable() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::current_dir().unwrap().join("target/scratch-strict-size");
+        let _ = std::fs::set_permissions(dir.join("locked"), std::fs::Permissions::from_mode(0o755));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("locked")).unwrap();
+        std::fs::write(dir.join("a.bin"), vec![0u8; 1000]).unwrap();
+        std::fs::write(dir.join("locked/b.bin"), vec![0u8; 500]).unwrap();
+        assert_eq!(strict_size(&dir).unwrap(), 1500);
+        std::fs::set_permissions(dir.join("locked"), std::fs::Permissions::from_mode(0o000)).unwrap();
+        let locked = strict_size(&dir);
+        std::fs::set_permissions(dir.join("locked"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(locked.is_err(), "an unreadable folder must fail, not count as zero");
+        assert!(strict_size(&dir.join("missing")).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
 
