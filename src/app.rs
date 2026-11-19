@@ -347,11 +347,12 @@ impl App {
 
     /// Look again for Full Disk Access (cheap); move on once it's there.
     fn check_access(&mut self) {
-        if self.shot.is_some() || self.full_access != Some(false) {
+        if self.shot.is_some() {
             return;
         }
+        let previous = self.full_access;
         self.full_access = platform::full_disk_access();
-        if self.full_access == Some(true) {
+        if previous == Some(false) && self.full_access == Some(true) {
             self.setup.retain(|s| *s != Setup::Access);
             if self.setup.is_empty() {
                 self.finish_setup("done");
@@ -364,7 +365,9 @@ impl App {
         if self.demo {
             return;
         }
-        self.check_access();
+        if self.full_access == Some(false) {
+            self.check_access();
+        }
         self.volumes = platform::volumes();
         self.disks_read = std::time::Instant::now();
         self.hidden_volumes = self
@@ -606,7 +609,7 @@ impl eframe::App for App {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
 
-        // Coming back from System Settings: see if access was just turned on.
+        // System Settings may have granted or revoked access while we were away.
         let focused = ctx.input(|i| i.focused);
         if focused && !self.was_focused {
             self.check_access();
@@ -663,6 +666,21 @@ impl App {
             ui.add_space(4.0);
             ui.label(RichText::new("Disk Sweeper").size(18.0).strong().color(TEXT));
         });
+        if let Some(granted) = self.full_access {
+            let (label, color, tip) = if granted {
+                ("✔  Full Disk Access", GOOD, "Disk Sweeper can include protected data such as Mail and Messages in scans.")
+            } else {
+                ("⚠  Limited access", DANGER, "Scans skip protected data such as Mail and Messages. Click to open Full Disk Access settings.")
+            };
+            let badge = egui::Button::new(RichText::new(label).size(12.0).color(color))
+                .fill(CARD)
+                .stroke(Stroke::new(1.0, color))
+                .rounding(12.0)
+                .sense(if granted { Sense::hover() } else { Sense::click() });
+            if ui.add(badge).on_hover_text(tip).clicked() && !granted {
+                platform::open(Path::new(platform::FULL_DISK_ACCESS_SETTINGS));
+            }
+        }
         ui.add_space(18.0);
 
         for (tab, icon, label) in [
