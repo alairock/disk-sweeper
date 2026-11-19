@@ -6,6 +6,8 @@ A small desktop app for macOS and Windows that shows what is using your disk and
 out what you don't need. It is written in Rust with [egui](https://github.com/emilk/egui).
 Every feature is free: scan and clean as often as you like.
 
+Get the macOS or Windows binary from [GitHub Releases](https://github.com/alairock/disk-sweeper/releases/latest). See the [download and install notes](docs/release-install.md).
+
 ![Overview](docs/screenshots/overview.png)
 
 The screenshots use made-up demo data (see [Screenshots](#screenshots)).

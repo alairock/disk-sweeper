@@ -1,0 +1,132 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.manifest.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+      - id: manifest
+        name: Check tag against Cargo.toml
+        run: |
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')
+          if [[ "$GITHUB_REF_TYPE" == tag && "$GITHUB_REF_NAME" != "v$version" ]]; then
+            echo "::error::Expected tag v$version for this Cargo.toml"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  macos:
+    needs: version
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      # Optional Developer ID signing and notarization. Configure all six repository
+      # secrets to enable it on tag pushes. Manual dry runs always exercise ad-hoc signing.
+      - name: Configure optional Apple signing credentials
+        if: github.event_name == 'push'
+        env:
+          CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}
+          CERT_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          IDENTITY: ${{ secrets.APPLE_SIGN_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APP_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          if [[ -z "$CERTIFICATE" || -z "$CERT_PASSWORD" || -z "$IDENTITY" ||
+                -z "$APPLE_ID" || -z "$APP_PASSWORD" || -z "$TEAM_ID" ]]; then
+            echo "Apple signing credentials incomplete. Using ad-hoc signing."
+            exit 0
+          fi
+          keychain="$RUNNER_TEMP/release.keychain-db"
+          password=$(openssl rand -hex 32)
+          security create-keychain -p "$password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$password" "$keychain"
+          security list-keychains -d user -s "$keychain" "$HOME/Library/Keychains/login.keychain-db"
+          cert="$RUNNER_TEMP/certificate.p12"
+          trap 'rm -f "$cert"' EXIT
+          printf '%s' "$CERTIFICATE" | base64 -D > "$cert"
+          security import "$cert" -k "$keychain" -P "$CERT_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$password" "$keychain" >/dev/null
+          xcrun notarytool store-credentials disk-sweeper --apple-id "$APPLE_ID" \
+            --team-id "$TEAM_ID" --password "$APP_PASSWORD"
+          echo "SIGN_IDENTITY=$IDENTITY" >> "$GITHUB_ENV"
+          echo "NOTARY_PROFILE=disk-sweeper" >> "$GITHUB_ENV"
+
+      - name: Build universal app, DMG and ZIP
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: tools/release-macos.sh "$VERSION"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: macos-universal
+          path: |
+            dist/*.dmg
+            dist/*.zip
+          if-no-files-found: error
+          compression-level: 0
+
+  windows:
+    needs: version
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      # Static CRT so the .exe runs on machines without the VC++ redistributable.
+      - run: cargo build --locked --release
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
+      - name: Package Windows executable
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          Copy-Item target/release/disk-sweeper.exe 'Disk Sweeper.exe'
+          Compress-Archive -LiteralPath 'Disk Sweeper.exe' -DestinationPath "DiskSweeper-$env:VERSION-windows-x64.zip"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows-x64
+          path: DiskSweeper-*-windows-x64.zip
+          if-no-files-found: error
+          compression-level: 0
+
+  release:
+    needs: [version, macos, windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksum the three release assets
+        working-directory: dist
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          sha256sum "DiskSweeper-$VERSION-macos-universal."{dmg,zip} \
+            "DiskSweeper-$VERSION-windows-x64.zip" > SHA256SUMS
+      - uses: actions/upload-artifact@v7
+        with:
+          name: checksums
+          path: dist/SHA256SUMS
+          if-no-files-found: error
+      - name: Publish tagged release
+        if: github.event_name == 'push' && github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes \
+            --notes-file docs/release-install.md dist/*.dmg dist/*.zip dist/SHA256SUMS
