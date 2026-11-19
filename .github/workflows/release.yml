@@ -83,7 +83,10 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v5
+      # Static CRT so the .exe runs on machines without the VC++ redistributable.
       - run: cargo build --locked --release
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
       - name: Package Windows executable
         env:
           VERSION: ${{ needs.version.outputs.version }}
