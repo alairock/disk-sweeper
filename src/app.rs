@@ -86,6 +86,8 @@ struct Partial {
 enum Setup {
     /// Windows: what the app does.
     Welcome,
+    /// Cleanups delete files: the person accepts that once, before anything is removed.
+    Risk,
     /// macOS: running from outside /Applications.
     Move,
     /// macOS: ask for Full Disk Access.
@@ -154,6 +156,12 @@ fn setup_file() -> PathBuf {
     dir.parent().map_or(dir.clone(), Path::to_path_buf).join("setup")
 }
 
+/// Exists once the person has accepted the risk of deleting files (asked even if setup was
+/// already done before this step existed).
+fn risk_file() -> PathBuf {
+    setup_file().with_file_name("accepted-risk")
+}
+
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, shot: Option<PathBuf>, shot_tab: Option<String>, demo: bool) -> Self {
         style(&cc.egui_ctx);
@@ -192,10 +200,14 @@ impl App {
             was_focused: true,
             demo,
         };
-        if app.use_saved && std::fs::read_to_string(setup_file()).is_err() {
-            if cfg!(windows) {
-                app.setup.push(Setup::Welcome);
-            }
+        let first_run = app.use_saved && std::fs::read_to_string(setup_file()).is_err();
+        if first_run && cfg!(windows) {
+            app.setup.push(Setup::Welcome);
+        }
+        if app.use_saved && !risk_file().exists() {
+            app.setup.push(Setup::Risk);
+        }
+        if first_run {
             if platform::outside_applications().is_some() {
                 app.setup.push(Setup::Move);
             }
@@ -245,6 +257,7 @@ impl App {
                     app.full_access = Some(false);
                     app.setup = match t {
                         "setup-welcome" => vec![Setup::Welcome],
+                        "setup-risk" => vec![Setup::Risk],
                         "setup-move" => vec![Setup::Move, Setup::Access],
                         _ => vec![Setup::Access],
                     };
@@ -1699,6 +1712,37 @@ impl App {
                     ui.label(RichText::new(note).size(12.0).color(DIM));
                     ui.add_space(12.0);
                     next = accent_button(ui, "Get started").clicked();
+                }
+                Setup::Risk => {
+                    ui.label(RichText::new("Before you clean up").size(22.0).strong().color(TEXT));
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new(format!(
+                            "Disk Sweeper removes files. It moves them to the {} where it can, but some cleanups \
+                             (caches, logs, temp files, emptying the {}) delete files for good. You decide what to \
+                             remove and are responsible for it, so back up anything important first.",
+                            platform::TRASH_NAME,
+                            platform::TRASH_NAME
+                        ))
+                        .color(TEXT),
+                    );
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new("Disk Sweeper is provided as is, without warranty of any kind (MIT / Apache-2.0).")
+                            .size(12.0)
+                            .color(DIM),
+                    );
+                    ui.add_space(12.0);
+                    if accent_button(ui, "I understand").clicked() {
+                        if self.use_saved {
+                            let file = risk_file();
+                            if let Some(dir) = file.parent() {
+                                let _ = std::fs::create_dir_all(dir);
+                            }
+                            let _ = std::fs::write(file, "accepted");
+                        }
+                        next = true;
+                    }
                 }
                 Setup::Move => {
                     ui.label(RichText::new("Move to Applications?").size(22.0).strong().color(TEXT));

@@ -10,6 +10,14 @@ Every feature is free: scan and clean as often as you like.
 
 The screenshots use made-up demo data (see [Screenshots](#screenshots)).
 
+## Use at your own risk
+
+Disk Sweeper deletes files. It moves them to the Trash or Recycle Bin where it can, but some
+cleanups (caches, logs, temp files, emptying the Trash) delete files permanently. You choose what
+to remove and you are responsible for it, so back up anything important first. Disk Sweeper is
+provided "as is", without warranty of any kind, as stated in the MIT and Apache-2.0 licenses. The
+app asks you to acknowledge this once before your first cleanup.
+
 ## Features
 
 - **Overview**: your disks with used and free space, the Trash or Recycle Bin size, and recent
