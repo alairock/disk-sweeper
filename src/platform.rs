@@ -34,15 +34,6 @@ pub fn space(path: &Path) -> Option<(u64, u64)> {
     Some((st.f_blocks as u64 * frsize, st.f_bavail as u64 * frsize))
 }
 
-#[cfg(target_os = "macos")]
-fn read_only(path: &Path) -> bool {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-    let Ok(c) = CString::new(path.as_os_str().as_bytes()) else { return true };
-    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
-    unsafe { libc::statvfs(c.as_ptr(), &mut st) == 0 && st.f_flag & libc::ST_RDONLY != 0 }
-}
-
 #[cfg(windows)]
 pub fn space(path: &Path) -> Option<(u64, u64)> {
     use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
@@ -58,24 +49,29 @@ pub fn volumes() -> Vec<Volume> {
     if let Some((total, free)) = space(Path::new("/")) {
         out.push(Volume { name: "Main disk".into(), path: "/".into(), total, free });
     }
-    if let Ok(entries) = std::fs::read_dir("/Volumes") {
-        for e in entries.flatten() {
-            let p = e.path();
-            // The startup disk also appears here as a link back to "/".
-            if std::fs::symlink_metadata(&p).map_or(true, |m| m.file_type().is_symlink()) {
-                continue;
-            }
-            if let Some((total, free)) = space(&p) {
-                // Skip installer images (read-only) and system volumes that share the main disk.
-                let shares_main = out.first().map_or(false, |m: &Volume| m.total == total && m.free == free);
-                if total > 0 && !shares_main && !read_only(&p) {
-                    let name = e.file_name().to_string_lossy().to_string();
-                    out.push(Volume { name, path: p, total, free });
-                }
+    let ms = mounts();
+    let main = mount_of(Path::new("/"), &ms).and_then(|m| m.group.clone());
+    for m in ms.iter().filter(|m| is_drive(m, main.as_deref())) {
+        if let Some((total, free)) = space(&m.path) {
+            if total > 0 {
+                let name = m.path.file_name().map_or_else(|| m.path.to_string_lossy(), |n| n.to_string_lossy()).to_string();
+                out.push(Volume { name, path: m.path.clone(), total, free });
             }
         }
     }
     out
+}
+
+/// A mount the user would call a separate drive. Leaves out what Finder hides (Recovery,
+/// Preboot, VM, … are mounted "nobrowse"), read-only installer images, and other volumes in
+/// the startup disk's own APFS container: those share its space and are counted as its
+/// hidden volumes instead.
+#[cfg(target_os = "macos")]
+fn is_drive(m: &Mount, main_group: Option<&str>) -> bool {
+    let hidden = (libc::MNT_DONTBROWSE | libc::MNT_RDONLY) as u32;
+    m.path.parent() == Some(Path::new("/Volumes"))
+        && m.flags & hidden == 0
+        && (m.group.is_none() || m.group.as_deref() != main_group)
 }
 
 // ---------- mounts (macOS): what a scan can't or shouldn't walk into ----------
@@ -88,6 +84,8 @@ struct Mount {
     group: Option<String>,
     /// The filesystem's device id, as files on it report it (st_dev).
     dev: u32,
+    /// Mount flags (MNT_RDONLY, MNT_DONTBROWSE, …).
+    flags: u32,
 }
 
 /// Space one volume uses (`df` reads it the same way). statfs's counts are for the whole
@@ -130,7 +128,7 @@ fn mounts() -> Vec<Mount> {
             let group = group_of(&device, &text(&s.f_fstypename));
             // Read from the mount table itself: no need to touch the mount (a stale network
             // share could hang a stat).
-            Mount { path: PathBuf::from(text(&s.f_mntonname)), group, dev: fsid_dev(s.f_fsid) }
+            Mount { path: PathBuf::from(text(&s.f_mntonname)), group, dev: fsid_dev(s.f_fsid), flags: s.f_flags }
         })
         .collect()
 }
@@ -703,6 +701,30 @@ pub fn empty_trash() -> Result<(), String> {
 
 #[cfg(all(test, unix))]
 mod tests {
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn only_user_volumes_are_drives() {
+        let m = |path: &str, flags: i32, group: Option<&str>| super::Mount {
+            path: path.into(),
+            group: group.map(str::to_string),
+            dev: 0,
+            flags: flags as u32,
+        };
+        let main = Some("/dev/disk3");
+        let drive = |path, flags, group| super::is_drive(&m(path, flags, group), main);
+        // macOS's own volumes: mounted nobrowse, or in the startup disk's container.
+        assert!(!drive("/Volumes/Recovery", libc::MNT_DONTBROWSE, Some("/dev/disk3")));
+        assert!(!drive("/Volumes/Recovery", 0, Some("/dev/disk3")));
+        assert!(!drive("/System/Volumes/Preboot", libc::MNT_DONTBROWSE, Some("/dev/disk3")));
+        assert!(!drive("/System/Volumes/Hardware", libc::MNT_DONTBROWSE, Some("/dev/disk1")));
+        assert!(!drive("/nix", libc::MNT_DONTBROWSE, Some("/dev/disk3")));
+        // Installer images.
+        assert!(!drive("/Volumes/Installer", libc::MNT_RDONLY, Some("/dev/disk9s1")));
+        // External disks and network shares.
+        assert!(drive("/Volumes/Backup", 0, Some("/dev/disk5")));
+        assert!(drive("/Volumes/Share", 0, None));
+    }
+
     #[test]
     fn same_name_never_overwrites() {
         let base = std::env::current_dir().unwrap().join("target/scratch-trash");
